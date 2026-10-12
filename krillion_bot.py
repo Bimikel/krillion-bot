@@ -97,6 +97,59 @@ async def board_for_puzzle(guild: discord.Guild, puzzle: int) -> str:
     return "\n".join(lines)
 
 
+# ---------- Elo ratings ----------
+# Each puzzle is treated as a round-robin: every pair of players who posted
+# that puzzle "plays" a match, and the higher score wins (equal = draw).
+# Ratings are recalculated from the saved results whenever they're needed,
+# so nothing extra is stored and the formula can be tweaked anytime.
+START_ELO = 1000
+K_FACTOR = 32  # how far one day's results can move a rating
+
+
+def compute_elo(guild_id: int, through: int | None = None) -> dict[int, tuple[float, int]]:
+    """Ratings after replaying every puzzle up to `through` (inclusive).
+    Returns {user_id: (rating, rated_games)}."""
+    query = "SELECT puzzle, user_id, score FROM results WHERE guild_id = ?"
+    params: list = [guild_id]
+    if through is not None:
+        query += " AND puzzle <= ?"
+        params.append(through)
+    query += " ORDER BY puzzle"
+
+    by_puzzle: dict[int, list[tuple[int, int]]] = {}
+    for puzzle, user_id, score in db.execute(query, params):
+        by_puzzle.setdefault(puzzle, []).append((user_id, score))
+
+    ratings: dict[int, float] = {}
+    games: dict[int, int] = {}
+    for puzzle in sorted(by_puzzle):
+        players = by_puzzle[puzzle]
+        n = len(players)
+        if n < 2:
+            continue  # a solo day has nobody to compare against
+        before = {uid: ratings.get(uid, START_ELO) for uid, _ in players}
+        for uid, score in players:
+            change = 0.0
+            for other, other_score in players:
+                if other == uid:
+                    continue
+                expected = 1 / (1 + 10 ** ((before[other] - before[uid]) / 400))
+                actual = 1.0 if score > other_score else 0.5 if score == other_score else 0.0
+                change += actual - expected
+            # Divide by (n - 1) so a big day doesn't swing ratings more than a small one
+            ratings[uid] = before[uid] + K_FACTOR * change / (n - 1)
+            games[uid] = games.get(uid, 0) + 1
+
+    return {uid: (ratings[uid], games[uid]) for uid in ratings}
+
+
+def finished_through(guild_id: int) -> int | None:
+    """Last puzzle whose results are final. Today's puzzle is still in progress,
+    so it isn't rated until the midnight reset."""
+    today = latest_puzzle(guild_id, since=last_reset())
+    return today - 1 if today is not None else None
+
+
 # ---------- Bot setup ----------
 intents = discord.Intents.default()
 intents.message_content = True  # needed to read pasted results
@@ -180,6 +233,23 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), allowed_mentions=NO_PINGS)
 
 
+@bot.tree.command(description="Elo ratings, based on head-to-head daily scores")
+async def elo(interaction: discord.Interaction):
+    ratings = compute_elo(interaction.guild_id, finished_through(interaction.guild_id))
+    if not ratings:
+        await interaction.response.send_message(
+            "No ratings yet. Ratings start once two or more people play the same puzzle "
+            "and that puzzle finishes at midnight.")
+        return
+    await interaction.response.defer()  # name lookups can take a moment
+    ranked = sorted(ratings.items(), key=lambda item: item[1][0], reverse=True)[:10]
+    lines = ["**Krillion Elo ratings**"]
+    for rank, (user_id, (rating, games)) in enumerate(ranked, start=1):
+        lines.append(f"{rank}. {await name_of(interaction.guild, user_id)} — "
+                     f"{rating:.0f} ({games} rated games)")
+    await interaction.followup.send("\n".join(lines), allowed_mentions=NO_PINGS)
+
+
 @bot.tree.command(description="Stats for one player")
 @app_commands.describe(member="Whose stats to show (defaults to you)")
 async def stats(interaction: discord.Interaction, member: discord.Member | None = None):
@@ -199,8 +269,11 @@ async def stats(interaction: discord.Interaction, member: discord.Member | None 
     ).fetchall()
     games, avg, best = summary
     recent_text = ", ".join(f"#{p}: {s}" for p, s in recent)
+    ratings = compute_elo(interaction.guild_id, finished_through(interaction.guild_id))
+    rating_text = f"{ratings[member.id][0]:.0f}" if member.id in ratings else "unrated"
     await interaction.response.send_message(
-        f"**{member.display_name}** — {games} games, avg {avg:.0f}, best {best}\n"
+        f"**{member.display_name}** — {games} games, avg {avg:.0f}, best {best}, "
+        f"Elo {rating_text}\n"
         f"Recent: {recent_text}"
     )
 
@@ -229,6 +302,19 @@ async def daily_summary():
         if puzzle is None:
             continue  # nobody played that puzzle here
         text = await board_for_puzzle(channel.guild, puzzle)
+
+        # Rating changes from this puzzle
+        before = compute_elo(guild_id, through=puzzle - 1)
+        after = compute_elo(guild_id, through=puzzle)
+        changes = []
+        for user_id, (rating, _) in sorted(after.items(), key=lambda i: i[1][0], reverse=True):
+            old = before.get(user_id, (START_ELO, 0))[0]
+            if round(rating) != round(old) or user_id not in before:
+                changes.append(f"{await name_of(channel.guild, user_id)}: "
+                               f"{rating:.0f} ({rating - old:+.0f})")
+        if changes:
+            text += "\n\n**Elo changes**\n" + "\n".join(changes)
+
         await channel.send("🌊 **Final results**\n" + text, allowed_mentions=NO_PINGS)
 
 
